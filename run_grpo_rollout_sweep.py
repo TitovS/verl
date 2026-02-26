@@ -7,6 +7,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import math
 import os
 import pathlib
 import random
@@ -70,21 +71,60 @@ def _build_stub_samples(count: int, seed: int) -> List[Dict[str, Any]]:
     return rows
 
 
-def prepare_train_file(args: argparse.Namespace, out_dir: pathlib.Path) -> str:
-    repeat_factor = args.train_repeat_factor
-    stub_count = args.append_stub_samples
-    if repeat_factor <= 1 and stub_count <= 0:
-        return args.train_file
+def prepare_train_file(args: argparse.Namespace, out_dir: pathlib.Path) -> Dict[str, Any]:
+    manual_repeat = args.train_repeat_factor
+    manual_stub = args.append_stub_samples
+    auto_min = args.auto_min_train_samples
 
     try:
         import datasets
     except ImportError as exc:
+        if args.dry_run:
+            print(
+                "Warning: 'datasets' package not available; dry-run will skip automatic train-data augmentation."
+            )
+            return {
+                "train_file": args.train_file,
+                "base_samples": None,
+                "repeat_factor_used": args.train_repeat_factor,
+                "stub_samples_used": args.append_stub_samples,
+                "total_samples": None,
+                "auto_applied": False,
+            }
         raise RuntimeError(
             "datasets package is required for train-data augmentation. "
-            "Install it or run with --train-repeat-factor 1 --append-stub-samples 0."
+            "Install it or disable augmentation via --auto-min-train-samples 0 "
+            "--train-repeat-factor 1 --append-stub-samples 0."
         ) from exc
 
     base_ds = _load_dataset_file(args.train_file)
+    base_count = len(base_ds)
+    repeat_factor = manual_repeat
+    stub_count = manual_stub
+
+    # Auto-scale train data if too small after manual settings.
+    auto_applied = False
+    current_total = base_count * repeat_factor + stub_count
+    if auto_min > 0 and current_total < auto_min:
+        auto_applied = True
+        if base_count > 0:
+            needed_repeat = int(math.ceil(max(auto_min - stub_count, 1) / base_count))
+            repeat_factor = max(repeat_factor, needed_repeat)
+        current_total = base_count * repeat_factor + stub_count
+        if current_total < auto_min:
+            stub_count += auto_min - current_total
+            current_total = base_count * repeat_factor + stub_count
+
+    if repeat_factor <= 1 and stub_count <= 0:
+        return {
+            "train_file": args.train_file,
+            "base_samples": base_count,
+            "repeat_factor_used": 1,
+            "stub_samples_used": 0,
+            "total_samples": base_count,
+            "auto_applied": auto_applied,
+        }
+
     datasets_to_concat = [base_ds]
     if repeat_factor > 1:
         datasets_to_concat.extend(base_ds for _ in range(repeat_factor - 1))
@@ -101,13 +141,20 @@ def prepare_train_file(args: argparse.Namespace, out_dir: pathlib.Path) -> str:
     merged_ds.to_parquet(str(aug_path))
     print(
         "Prepared augmented train data:",
-        f"base={len(base_ds)}",
+        f"base={base_count}",
         f"repeat_factor={repeat_factor}",
         f"stub_samples={stub_count}",
         f"total={len(merged_ds)}",
         f"path={aug_path}",
     )
-    return str(aug_path)
+    return {
+        "train_file": str(aug_path),
+        "base_samples": base_count,
+        "repeat_factor_used": repeat_factor,
+        "stub_samples_used": stub_count,
+        "total_samples": len(merged_ds),
+        "auto_applied": auto_applied,
+    }
 
 
 def query_gpu_inventory(gpu_ids: List[int]) -> List[Dict[str, Any]]:
@@ -235,7 +282,8 @@ def build_base_overrides(args: argparse.Namespace) -> List[str]:
         "trainer.nnodes=1",
         f"trainer.save_freq={args.save_freq}",
         f"trainer.test_freq={args.test_freq}",
-        f"trainer.total_epochs={args.total_epochs}",
+        "trainer.total_epochs=1",
+        f"trainer.total_training_steps={args.total_training_steps}",
     ]
 
 
@@ -495,8 +543,8 @@ def run_one(
             "context_size": context_size,
             "max_prompt_length": prompt_len,
             "max_response_length": response_len,
-            "train_repeat_factor": args.train_repeat_factor,
-            "append_stub_samples": args.append_stub_samples,
+            "train_repeat_factor": args.train_repeat_factor_used,
+            "append_stub_samples": args.append_stub_samples_used,
             "rollout_gpu_mem_util": args.rollout_gpu_mem_util,
             "experiment_name": exp_name,
             "exit_code": None,
@@ -543,8 +591,8 @@ def run_one(
         "context_size": context_size,
         "max_prompt_length": prompt_len,
         "max_response_length": response_len,
-        "train_repeat_factor": args.train_repeat_factor,
-        "append_stub_samples": args.append_stub_samples,
+        "train_repeat_factor": args.train_repeat_factor_used,
+        "append_stub_samples": args.append_stub_samples_used,
         "rollout_gpu_mem_util": args.rollout_gpu_mem_util,
         "experiment_name": exp_name,
         "exit_code": proc.returncode,
@@ -574,6 +622,12 @@ def main() -> int:
     parser.add_argument("--python", default=sys.executable, help="Python executable to launch training.")
     parser.add_argument("--train-file", default="~/data/gsm8k/train.parquet")
     parser.add_argument("--val-file", default="~/data/gsm8k/test.parquet")
+    parser.add_argument(
+        "--auto-min-train-samples",
+        type=int,
+        default=500,
+        help="Automatically upsample train data to at least this many samples. Set 0 to disable.",
+    )
     parser.add_argument("--train-repeat-factor", type=int, default=1, help="Repeat train dataset N times.")
     parser.add_argument(
         "--append-stub-samples",
@@ -606,7 +660,7 @@ def main() -> int:
     parser.add_argument("--rollout-gpu-mem-util", type=float, default=0.4)
     parser.add_argument("--project-name", default="verl_grpo_rollout_sweep")
     parser.add_argument("--experiment-prefix", default="quickstart_grpo")
-    parser.add_argument("--total-epochs", type=int, default=1)
+    parser.add_argument("--total-training-steps", type=int, default=10)
     parser.add_argument("--save-freq", type=int, default=10)
     parser.add_argument("--test-freq", type=int, default=10)
     parser.add_argument("--output-dir", default="runs/grpo_rollout_sweep")
@@ -660,16 +714,30 @@ def main() -> int:
     if args.append_stub_samples < 0:
         print("--append-stub-samples must be >= 0.", file=sys.stderr)
         return 2
+    if args.auto_min_train_samples < 0:
+        print("--auto-min-train-samples must be >= 0.", file=sys.stderr)
+        return 2
+    if args.total_training_steps < 1:
+        print("--total-training-steps must be >= 1.", file=sys.stderr)
+        return 2
 
     try:
-        args.train_file_prepared = prepare_train_file(args, out_dir)
+        prep = prepare_train_file(args, out_dir)
+        args.train_file_prepared = prep["train_file"]
+        args.train_repeat_factor_used = prep["repeat_factor_used"]
+        args.append_stub_samples_used = prep["stub_samples_used"]
     except Exception as exc:
         print(f"Failed to prepare augmented train data: {exc}", file=sys.stderr)
         return 2
 
     print(f"Train data file used: {args.train_file_prepared}")
-    print(f"Train repeat factor: {args.train_repeat_factor}")
-    print(f"Appended stub samples: {args.append_stub_samples}")
+    print(f"Base train samples: {prep['base_samples']}")
+    print(f"Auto min train samples target: {args.auto_min_train_samples}")
+    print(f"Train repeat factor used: {args.train_repeat_factor_used}")
+    print(f"Appended stub samples used: {args.append_stub_samples_used}")
+    print(f"Prepared total train samples: {prep['total_samples']}")
+    print(f"Auto augmentation applied: {prep['auto_applied']}")
+    print(f"Total training steps: {args.total_training_steps}")
     base_overrides = build_base_overrides(args)
 
     gpu_inventory: List[Dict[str, Any]] = []
