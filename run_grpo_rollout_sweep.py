@@ -53,7 +53,8 @@ def _build_stub_samples(count: int, seed: int) -> List[Dict[str, Any]]:
         question = f"{question_raw} {instruction}"
         rows.append(
             {
-                "data_source": "stub/gsm8k_arithmetic",
+                # Keep GSM8K scorer compatibility in verl reward dispatch.
+                "data_source": "openai/gsm8k",
                 "prompt": [{"role": "user", "content": question}],
                 "ability": "math",
                 "reward_model": {"style": "rule", "ground_truth": answer},
